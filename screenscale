@@ -1,0 +1,434 @@
+#!/usr/bin/env bash
+#
+# screenscale — per-monitor display scaling for Hyprland (mixed-DPI setups).
+#
+# Why this exists
+#   One global scale cannot serve two panels of different pixel density: the
+#   value that makes a ~200 PPI laptop comfortable makes a ~100 PPI external
+#   enormous. Hyprland scales per output, so this tool
+#     • shows the PPI maths, so you can pick a scale instead of guessing,
+#     • applies a scale live to one monitor without touching the others,
+#     • persists each choice into a managed block in monitors.lua,
+#     • re-applies saved scales on hotplug, so a known screen lands on its own
+#       scale wherever you plug it in.
+#
+# How choices are keyed
+#   Internal panels (eDP/LVDS/DSI) are keyed by OUTPUT NAME: they never move,
+#   and Omarchy's clamshell watcher parses monitors.lua looking for exactly that
+#   form — see the note in cmd_save. Everything else is keyed by EDID
+#   DESCRIPTION, so an external monitor's scale follows the physical screen
+#   across ports, docks and locations rather than being pinned to HDMI-A-1.
+#
+# Files
+#   ~/.config/hypr/monitors.lua        holds the managed block (markers below)
+#   ~/.local/state/screenscale.log     append-only action log
+#
+set -euo pipefail
+
+readonly PRESETS=(1 1.25 1.5 1.6 1.75 2 2.5 3)
+readonly MONITORS_LUA="$HOME/.config/hypr/monitors.lua"
+readonly MARK_START="-- >>> screenscale: managed block — edit with \`screenscale save\` >>>"
+readonly MARK_END="-- <<< screenscale <<<"
+readonly LOG="${XDG_STATE_HOME:-$HOME/.local/state}/screenscale.log"
+readonly SETTLE="${XDG_RUNTIME_DIR:-/tmp}/screenscale-settle"
+
+# ---------------------------------------------------------------- utilities --
+
+die() { printf 'screenscale: %s\n' "$*" >&2; exit 1; }
+
+log_action() {
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null || return 0
+  printf '%s\t%s\n' "$(date -Is)" "$*" >>"$LOG"
+}
+
+need() { command -v "$1" >/dev/null || die "missing dependency: $1"; }
+
+monitors_json() { hyprctl monitors -j; }
+
+# Resolve a selector to monitor names, one per line.
+#   (empty) | focused -> the focused monitor
+#   all               -> every connected monitor
+#   <text>            -> case-insensitive substring of the output name or of
+#                        the EDID description (eDP-2, hdmi, r22l, ...)
+resolve_monitors() {
+  local sel="${1:-focused}" out
+  case "$sel" in
+    ""|focused) out=$(monitors_json | jq -r '.[] | select(.focused) | .name') ;;
+    all)        out=$(monitors_json | jq -r '.[].name') ;;
+    *)          out=$(monitors_json | jq -r --arg s "$sel" \
+                  '.[] | select((.name        | ascii_downcase | contains($s | ascii_downcase))
+                             or (.description | ascii_downcase | contains($s | ascii_downcase))) | .name') ;;
+  esac
+  [[ -n $out ]] || die "no monitor matches '$sel' (try: screenscale list)"
+  printf '%s\n' "$out"
+}
+
+# The position saved for this output, or "auto" if we have none yet.
+saved_position() {
+  local name="$1" desc key pos
+  desc=$(monitors_json | jq -r --arg n "$1" '.[] | select(.name == $n) | .description')
+  case "$name" in eDP-*|LVDS-*|DSI-*) key="$name" ;; *) key="desc:$desc" ;; esac
+  pos=$(awk -v s="$MARK_START" -v e="$MARK_END" '$0 == s { inb = 1; next } $0 == e { inb = 0 } inb' "$MONITORS_LUA" 2>/dev/null |
+    sed -nE 's/^hl\.monitor\(\{ output = "'"$(printf '%s' "$key" | sed 's/[][\.*^$\/]/\\&/g')"'", mode = [^,]*, position = "([^"]*)".*/\1/p' | head -1)
+  printf '%s\n' "${pos:-auto}"
+}
+
+monitor_field() { monitors_json | jq -r --arg n "$1" --arg f "$2" '.[] | select(.name == $n) | .[$f]'; }
+
+# Hyprland only accepts scales that divide the mode into whole logical pixels
+# (in 1/120 steps). Round a requested scale up to the nearest legal value.
+clean_scale() {
+  awk -v scale="$1" -v width="$2" -v height="$3" '
+    function gcd(a, b, t) { while (b) { t = a % b; a = b; b = t } return a }
+    BEGIN {
+      g = gcd(width * 120, height * 120)
+      k = int(scale * 120 + 0.5)
+      if (k < 1) k = 1
+      if (k > g) k = g
+      while (g % k != 0) k++
+      printf "%g\n", k / 120
+    }'
+}
+
+# ------------------------------------------------------------------ reporting --
+
+cmd_list() {
+  printf '%-10s  %-26s  %-14s  %5s  %5s  %7s  %-11s\n' \
+    OUTPUT MONITOR MODE PPI SCALE EFF-PPI LOGICAL
+  printf '%-10s  %-26s  %-14s  %5s  %5s  %7s  %-11s\n' \
+    '---------' '-------------------------' '-------------' '-----' '-----' '-------' '----------'
+  monitors_json | jq -r '.[] | [.name, .description, .width, .height, .refreshRate,
+                                .physicalWidth, .physicalHeight, .scale, .focused] | @tsv' |
+  while IFS=$'\t' read -r name desc w h rr pw ph scale focused; do
+    native=$(awk -v w="$w" -v pw="$pw" 'BEGIN { printf "%.0f", (pw > 0 ? w / (pw / 25.4) : 0) }')
+    eff=$(awk -v p="$native" -v s="$scale" 'BEGIN { printf "%.0f", p / s }')
+    logical=$(awk -v w="$w" -v h="$h" -v s="$scale" 'BEGIN { printf "%dx%d", w / s, h / s }')
+    mark=""; [[ $focused == true ]] && mark=" *"
+    printf '%-10s  %-26.26s  %-14s  %5s  %5s  %7s  %-11s%s\n' \
+      "$name" "$desc" "$(printf '%dx%d@%.0f' "$w" "$h" "$rr")" \
+      "$native" "$scale" "$eff" "$logical" "$mark"
+  done
+  printf '\n  * = focused.  PPI = the panel'"'"'s real pixel density.  EFF-PPI = how dense it looks.\n'
+  printf '  Two screens feel the same size when their EFF-PPI match.\n'
+}
+
+# -------------------------------------------------------------------- setting --
+
+# apply_scale <output> <scale> [--no-save]
+# Changes are persisted immediately by default. There is deliberately no
+# separate "approve" step: omarchy-hyprland-monitor-clamshell re-reads
+# monitors.lua every ~2s while docked and forces the internal panel back to
+# whatever it finds there, so an unsaved change would simply be undone.
+apply_scale() {
+  local name="$1" requested="$2" save="${3:-}" w h rr current new
+  w=$(monitor_field "$name" width)
+  h=$(monitor_field "$name" height)
+  rr=$(monitor_field "$name" refreshRate)
+  current=$(monitor_field "$name" scale)
+  new=$(clean_scale "$requested" "$w" "$h")
+
+  local pos; pos=$(saved_position "$name")
+  hyprctl eval "hl.monitor({ output = \"$name\", mode = \"${w}x${h}@${rr}\", position = \"$pos\", scale = $new })" >/dev/null
+  log_action "set $name $current -> $new (requested $requested)"
+  [[ $save == --no-save ]] || persist_block
+  printf '%s: scale %s -> %s  (%dx%d logical)\n' "$name" "$current" "$new" \
+    "$(awk -v w="$w" -v s="$new" 'BEGIN { printf "%d", w / s }')" \
+    "$(awk -v h="$h" -v s="$new" 'BEGIN { printf "%d", h / s }')"
+}
+
+cmd_set() {
+  local requested="${1:-}" sel="${2:-focused}"
+  [[ $requested =~ ^[0-9]+([.][0-9]+)?$ ]] || die "scale must be a number, got '${requested:-}'"
+  awk -v s="$requested" 'BEGIN { exit !(s >= 0.5 && s <= 4) }' || die "scale must be between 0.5 and 4"
+  while read -r name; do apply_scale "$name" "$requested"; done < <(resolve_monitors "$sel")
+}
+
+# Step to the neighbouring preset, comparing on the *legal* scale for this mode
+# so repeated presses always move to a distinct value.
+cmd_step() {
+  local direction="$1" sel="${2:-focused}" name w h current
+  name=$(resolve_monitors "$sel" | head -1)
+  w=$(monitor_field "$name" width); h=$(monitor_field "$name" height)
+  current=$(monitor_field "$name" scale)
+
+  local -a legal=()
+  for p in "${PRESETS[@]}"; do
+    c=$(clean_scale "$p" "$w" "$h")
+    [[ " ${legal[*]-} " == *" $c "* ]] || legal+=("$c")
+  done
+
+  local best=0 best_diff=999
+  for i in "${!legal[@]}"; do
+    d=$(awk -v a="${legal[$i]}" -v b="$current" 'BEGIN { d = a - b; printf "%.6f", (d < 0 ? -d : d) }')
+    awk -v d="$d" -v bd="$best_diff" 'BEGIN { exit !(d < bd) }' && { best=$i; best_diff=$d; }
+  done
+
+  local target=$best
+  [[ $direction == up   && $best -lt $(( ${#legal[@]} - 1 )) ]] && target=$(( best + 1 ))
+  [[ $direction == down && $best -gt 0 ]] && target=$(( best - 1 ))
+  apply_scale "$name" "${legal[$target]}"
+}
+
+# Pick the scale that lands closest to a target apparent density.
+cmd_ppi() {
+  local target="${1:-}" sel="${2:-focused}"
+  [[ $target =~ ^[0-9]+$ ]] || die "usage: screenscale ppi <target-ppi> [monitor]"
+  while read -r name; do
+    local w pw native want
+    w=$(monitor_field "$name" width); pw=$(monitor_field "$name" physicalWidth)
+    [[ ${pw%.*} -gt 0 ]] || { printf '%s: no physical size in EDID, skipping\n' "$name"; continue; }
+    native=$(awk -v w="$w" -v pw="$pw" 'BEGIN { printf "%.2f", w / (pw / 25.4) }')
+    want=$(awk -v n="$native" -v t="$target" 'BEGIN { printf "%.4f", n / t }')
+    apply_scale "$name" "$want"
+  done < <(resolve_monitors "$sel")
+}
+
+# ---------------------------------------------------------------- persistence --
+
+# One rule per connected monitor. Internal panels are keyed by output name on a
+# SINGLE LINE on purpose: omarchy-hyprland-monitor-clamshell runs every ~2s
+# while docked and greps monitors.lua for `hl.monitor({ ... output = "eDP-2"`
+# to learn the internal panel's intended scale. If it finds none it falls back
+# through the catch-all rule and finally to a hardcoded 2 — and then forces the
+# panel to 2 every couple of seconds. Keeping this line here is what stops that.
+generate_block() {
+  monitors_json | jq -r '
+    def internal: test("^(eDP|LVDS|DSI)-");
+    def abs: if . < 0 then -. else . end;
+
+    . as $all
+    | ([$all[] | select(.name | internal)]       | first) as $int
+    | ([$all[] | select((.name | internal) | not)] | first) as $anc
+
+    # Positions are written out explicitly rather than left on "auto".
+    # With "auto", changing the internal panel'"'"'s scale changes its logical
+    # width, which shoves every monitor after it sideways — so retuning the
+    # laptop visibly moved everything on the external screen. Pinning the
+    # external and re-seating the laptop flush against it keeps a scale change
+    # local to the screen being changed.
+    | [ $all[]
+        | . as $m
+        | (if ($int != null) and ($anc != null) and ($m.name == $int.name) then
+             (($int.width  / $int.scale) | floor) as $lw
+           | (($int.height / $int.scale) | floor) as $lh
+           | (($anc.width  / $anc.scale) | floor) as $aw
+           | (($anc.height / $anc.scale) | floor) as $ah
+           | ((($int.x + $lw / 2) - ($anc.x + $aw / 2))) as $dx
+           | ((($int.y + $lh / 2) - ($anc.y + $ah / 2))) as $dy
+           | (if ($dx | abs) >= ($dy | abs)
+              then (if $dx < 0 then { x: ($anc.x - $lw), y: $anc.y }
+                                else { x: ($anc.x + $aw), y: $anc.y } end)
+              else (if $dy < 0 then { x: $anc.x, y: ($anc.y - $lh) }
+                                else { x: $anc.x, y: ($anc.y + $ah) } end)
+              end)
+           else { x: $m.x, y: $m.y }
+           end) as $pos
+        | ((if ($m.name | internal) then $m.name else "desc:" + $m.description end)) as $key
+        | "hl.monitor({ output = \"\($key)\", mode = \"preferred\", position = \"\($pos.x)x\($pos.y)\", scale = \($m.scale) })"
+      ] | .[]'
+}
+
+# Saved rules as "key<TAB>scale"; key is an output name or "desc:<description>".
+saved_pairs() {
+  [[ -f $MONITORS_LUA ]] || return 0
+  awk -v s="$MARK_START" -v e="$MARK_END" '$0 == s { inb = 1; next } $0 == e { inb = 0 } inb' "$MONITORS_LUA" |
+    sed -nE 's/^hl\.monitor\(\{ output = "([^"]*)", mode = .*scale = ([0-9.]+) \}\)$/\1\t\2/p'
+}
+
+# Rewrite the managed block from the live monitor state. Silent; safe to call
+# on every change and from the watcher.
+persist_block() {
+  [[ -f $MONITORS_LUA ]] || return 0
+  local body tmp
+  body=$(generate_block)
+  [[ -n $body ]] || return 0
+  tmp=$(mktemp)
+  awk -v body="$body" -v s="$MARK_START" -v e="$MARK_END" '
+    $0 == s { skip = 1; next }
+    $0 == e { skip = 0; done = 1; print s; print body; print e; next }
+    !skip   { print }
+    END     { if (!done) { print ""; print s; print body; print e } }
+  ' "$MONITORS_LUA" >"$tmp"
+  mv "$tmp" "$MONITORS_LUA"
+}
+
+cmd_save() {
+  [[ -f $MONITORS_LUA ]] || die "$MONITORS_LUA does not exist"
+  persist_block
+  log_action "save -> $MONITORS_LUA"
+  printf 'Saved %d monitor(s) into %s:\n\n' "$(monitors_json | jq 'length')" "$MONITORS_LUA"
+  saved_pairs | while IFS=$'\t' read -r k v; do printf '  %-34s scale %s\n' "$k" "$v"; done
+}
+
+# Re-apply saved scales to whatever is connected right now. Idempotent and
+# quiet when nothing needs changing, so it is safe to run from an event loop.
+cmd_apply() {
+  local changed=0 json
+  json=$(monitors_json)
+  while IFS=$'\t' read -r key scale; do
+    [[ -n $key ]] || continue
+    local name current
+    if [[ $key == desc:* ]]; then
+      name=$(printf '%s' "$json" | jq -r --arg d "${key#desc:}" '.[] | select(.description == $d) | .name' | head -1)
+    else
+      name=$(printf '%s' "$json" | jq -r --arg n "$key" '.[] | select(.name == $n) | .name' | head -1)
+    fi
+    [[ -n $name ]] || continue
+    current=$(printf '%s' "$json" | jq -r --arg n "$name" '.[] | select(.name == $n) | .scale' | head -1)
+    awk -v a="$current" -v b="$scale" 'BEGIN { exit !(a == b) }' && continue
+    apply_scale "$name" "$scale" --no-save
+    changed=1
+  done < <(saved_pairs)
+  [[ $changed == 0 && ${1:-} != --quiet ]] && echo "All connected monitors already match the saved scales."
+  return 0
+}
+
+cmd_forget() {
+  local sel="${1:-}"
+  [[ -n $sel ]] || die "usage: screenscale forget <monitor|all>"
+  local tmp; tmp=$(mktemp)
+  if [[ $sel == all ]]; then
+    awk -v s="$MARK_START" -v e="$MARK_END" '
+      $0 == s { skip = 1; next } $0 == e { skip = 0; next } !skip { print }' "$MONITORS_LUA" >"$tmp"
+    mv "$tmp" "$MONITORS_LUA"; log_action "forget all"
+    echo "Removed the managed block from $MONITORS_LUA."
+    return
+  fi
+  local key; key=$(monitors_json | jq -r --arg s "$sel" '
+    def internal: test("^(eDP|LVDS|DSI)-");
+    .[] | select((.name | ascii_downcase | contains($s | ascii_downcase))
+              or (.description | ascii_downcase | contains($s | ascii_downcase)))
+        | if (.name | internal) then .name else "desc:" + .description end' | head -1)
+  [[ -n $key ]] || die "no connected monitor matches '$sel'"
+  grep -vF "output = \"$key\"" "$MONITORS_LUA" >"$tmp" && mv "$tmp" "$MONITORS_LUA"
+  log_action "forget $key"
+  echo "Dropped \"$key\" from $MONITORS_LUA."
+}
+
+# --------------------------------------------------------------------- daemon --
+
+# Watch Hyprland events and re-apply saved scales when the display set changes.
+# This is what makes a saved scale "follow" a monitor: plug the same screen in
+# at another desk and it lands on its own scale without any manual step.
+# True while we are inside the settle window after a hotplug or config reload,
+# when a monitor may transiently sit on its own auto scale.
+settle_active() {
+  [[ -f $SETTLE ]] || return 1
+  local until; until=$(<"$SETTLE") 2>/dev/null || return 1
+  [[ $until =~ ^[0-9]+$ ]] || return 1
+  (( $(date +%s) < until ))
+}
+
+# Adopt scale changes made outside this tool — the Omarchy shell's display
+# panel, or `omarchy-hyprland-monitor-scaling` — by writing them into the
+# managed block. Without this, omarchy-hyprland-monitor-clamshell (which polls
+# every ~2s while docked) would read the old value out of monitors.lua and undo
+# the change a second later. Polling faster than that poll is the point.
+adopt_loop() {
+  local live saved
+  while true; do
+    sleep 0.6
+    settle_active && continue
+    live=$(monitors_json | jq -r '
+      def internal: test("^(eDP|LVDS|DSI)-");
+      .[] | "\(if (.name | internal) then .name else "desc:" + .description end)\t\(.scale)"' | sort)
+    saved=$(saved_pairs | sort)
+    [[ $live == "$saved" ]] && continue
+    persist_block
+    log_action "adopted external change: $(printf '%s' "$live" | tr '\n' ' ')"
+  done
+}
+
+# Watch Hyprland events and re-apply saved scales when the display set changes.
+# This is what makes a saved scale "follow" a monitor: plug the same screen in
+# at another desk and it lands on its own scale without any manual step.
+cmd_watch() {
+  local sock="$XDG_RUNTIME_DIR/hypr/${HYPRLAND_INSTANCE_SIGNATURE:-}/.socket2.sock"
+  [[ -S $sock ]] || die "Hyprland event socket not found at $sock"
+  need socat
+  exec 9>"${XDG_RUNTIME_DIR:-/tmp}/screenscale-watch.lock"
+  flock -n 9 || { log_action "watch: another instance already running"; exit 0; }
+  log_action "watch: started"
+
+  # Children must NOT inherit fd 9: an orphaned socat holding the lock would
+  # otherwise stop the watcher from ever being restarted.
+  adopt_loop 9>&- &
+  local adopt_pid=$!
+  trap 'rm -f "$SETTLE"; kill "$adopt_pid" 2>/dev/null' EXIT
+
+  cmd_apply --quiet >/dev/null 2>&1 || true
+
+  while read -r event; do
+    case "$event" in
+      monitoraddedv2\>\>*|monitorremovedv2\>\>*)
+        # A display was plugged or unplugged: put saved scales back. Hyprland
+        # re-probes outputs before it has finished re-reading the config, so a
+        # monitor can briefly sit on its own auto scale — hold the adopt loop
+        # off while that settles, then nudge a few times. cmd_apply is
+        # idempotent, so the extra passes are free.
+        #
+        # NOTE: `configreloaded` is deliberately NOT handled here. Every
+        # `hyprctl eval hl.monitor(...)` emits it — including the ones the
+        # Omarchy display panel and this tool make — so re-applying saved
+        # scales on that event would instantly undo any scale the user just
+        # chose. Hyprland re-applies the rules in monitors.lua on reload by
+        # itself, and the single-line internal rule keeps the clamshell watcher
+        # happy, so nothing here is needed for reloads.
+        printf '%s\n' "$(( $(date +%s) + 5 ))" >"$SETTLE"
+        ( for d in 0.3 1.2 3; do sleep "$d"; cmd_apply --quiet >/dev/null 2>&1 || true; done ) &
+        ;;
+    esac
+  done < <(socat -U - "UNIX-CONNECT:$sock" 9>&-)
+}
+
+cmd_log() { [[ -f $LOG ]] && tail -n "${1:-20}" "$LOG" || echo "no log yet at $LOG"; }
+
+usage() {
+  cat <<'USAGE'
+screenscale — per-monitor display scaling for Hyprland
+
+  screenscale                    show every monitor with its PPI maths
+  screenscale set <scale> [MON]  apply a scale live       (default: focused)
+  screenscale up|down [MON]      step through presets     (default: focused)
+  screenscale ppi <target> [MON] scale to a target apparent density
+  screenscale save               persist current scales into monitors.lua
+  screenscale apply              re-apply saved scales to what is connected now
+  screenscale watch              daemon: re-apply on hotplug/reload (autostart)
+  screenscale forget <MON|all>   drop a saved entry
+  screenscale log [n]            recent actions
+
+MON is an output name (eDP-2), part of a monitor description (r22l),
+"focused", or "all".
+
+Changes stick by themselves — set/up/down/ppi write straight into the managed
+block in monitors.lua, and the `watch` daemon adopts scale changes made from
+the Omarchy display panel too. There is no separate approve step, because
+Omarchy's clamshell watcher re-reads monitors.lua every ~2s and would undo
+anything left unsaved. Use `save` only to re-capture the current state by hand,
+and `forget` to drop an entry.
+
+Examples
+  screenscale ppi 105 all        make every screen look the same density
+  screenscale set 1 hdmi         external at native 1:1
+  screenscale up                 nudge the screen your mouse is on
+USAGE
+}
+
+# ---------------------------------------------------------------------- main --
+
+need hyprctl; need jq; need awk
+
+case "${1:-list}" in
+  list|ls|"")        cmd_list ;;
+  set)               shift; cmd_set "$@" ;;
+  up)                shift; cmd_step up "$@" ;;
+  down)              shift; cmd_step down "$@" ;;
+  ppi)               shift; cmd_ppi "$@" ;;
+  save)              cmd_save ;;
+  apply)             shift; cmd_apply "$@" ;;
+  watch)             cmd_watch ;;
+  forget)            shift; cmd_forget "$@" ;;
+  log)               shift; cmd_log "$@" ;;
+  -h|--help|help)    usage ;;
+  *)                 usage >&2; exit 1 ;;
+esac
