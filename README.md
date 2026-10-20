@@ -57,6 +57,8 @@ screenscale                    show every monitor with its PPI maths
 screenscale set <scale> [MON]  apply a scale live       (default: focused)
 screenscale up|down [MON]      step through presets     (default: focused)
 screenscale ppi <target> [MON] scale to a target apparent density
+screenscale mode <WxH[@HZ]|preferred> [MON]
+                               run below the preferred resolution
 screenscale save               persist current scales into monitors.lua
 screenscale apply              re-apply saved scales to what is connected now
 screenscale watch              daemon: re-apply on hotplug (autostart this)
@@ -64,7 +66,8 @@ screenscale forget <MON|all>   drop a saved entry
 screenscale log [n]            recent actions
 ```
 
-`MON` is an output name (`eDP-2`), any substring of the name or of the monitor
+`MON` is an exact output name (`eDP-2`; an exact match wins, so `DP-1` never
+also picks `eDP-1`), any substring of the name or of the monitor
 description (`hdmi`, `r22l`), `focused`, or `all`.
 
 **There is no save step.** `set` / `up` / `down` / `ppi` persist as they apply,
@@ -84,6 +87,29 @@ Nothing else. The scale is stored against the monitor's **EDID description**,
 not its connector, so the same screen gets the same scale next time you plug it
 in — a different port, a different dock, a different city.
 
+### A TV that stutters
+
+Many TVs advertise 4K@30 as their preferred mode, and over HDMI that is what
+Hyprland picks — every animation and scroll then runs at 30 fps.
+
+```bash
+screenscale mode 1920x1080@60 sony    # smooth again
+screenscale mode preferred sony       # back to what the TV asks for
+```
+
+The scale travels with the mode so the screen keeps its apparent size, as
+near as a legal scale allows: 4K at scale 2 becomes 1080p at scale 1. It never
+goes below 1. The mode must be one
+the monitor offers (`hyprctl monitors`); `@HZ` is optional and matches within
+half a hertz, so `@60` finds `59.94`. The choice is saved against the monitor's
+EDID description like its scale, so it sticks to that TV. On hotplug the
+watcher puts the saved mode back, and a monitor that is off its saved mode is
+never adopted into the block.
+
+Internal panels are the exception: Omarchy's clamshell watcher re-enables the
+laptop panel with `mode = "preferred"`, so a mode set on `eDP-*` does not
+survive closing and opening the lid.
+
 ## How it stores things
 
 `screenscale save` maintains a marker-delimited block at the end of
@@ -95,6 +121,10 @@ hl.monitor({ output = "eDP-2", mode = "preferred", position = "0x0", scale = 1.6
 hl.monitor({ output = "desc:RIS R22L R22L12051079", mode = "preferred", position = "1600x0", scale = 1 })
 -- <<< screenscale <<<
 ```
+
+`mode` stays `"preferred"` unless `screenscale mode` set it; every later save
+keeps the mode already recorded for that monitor rather than capturing the live
+one.
 
 Internal panels are keyed by **connector name**, on a single line. Externals are
 keyed by **EDID description**. Both details are load-bearing — see below.

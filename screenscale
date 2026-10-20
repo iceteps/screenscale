@@ -8,6 +8,8 @@
 #   enormous. Hyprland scales per output, so this tool
 #     • shows the PPI maths, so you can pick a scale instead of guessing,
 #     • applies a scale live to one monitor without touching the others,
+#     • lets a screen run below its preferred resolution (TVs that stutter at
+#       4K@30 are smooth at 1080p@60) while keeping its apparent size,
 #     • persists each choice into a managed block in monitors.lua,
 #     • re-applies saved scales on hotplug, so a known screen lands on its own
 #       scale wherever you plug it in.
@@ -48,26 +50,40 @@ monitors_json() { hyprctl monitors -j; }
 # Resolve a selector to monitor names, one per line.
 #   (empty) | focused -> the focused monitor
 #   all               -> every connected monitor
-#   <text>            -> case-insensitive substring of the output name or of
-#                        the EDID description (eDP-2, hdmi, r22l, ...)
+#   <text>            -> an exact output name if one matches (so "DP-1" never
+#                        also picks up "eDP-1"), else a case-insensitive
+#                        substring of the output name or of the EDID
+#                        description (eDP-2, hdmi, r22l, ...)
 resolve_monitors() {
   local sel="${1:-focused}" out
   case "$sel" in
     ""|focused) out=$(monitors_json | jq -r '.[] | select(.focused) | .name') ;;
     all)        out=$(monitors_json | jq -r '.[].name') ;;
     *)          out=$(monitors_json | jq -r --arg s "$sel" \
-                  '.[] | select((.name        | ascii_downcase | contains($s | ascii_downcase))
-                             or (.description | ascii_downcase | contains($s | ascii_downcase))) | .name') ;;
+                  'if any(.[]; .name == $s) then .[] | select(.name == $s) | .name
+                   else .[] | select((.name        | ascii_downcase | contains($s | ascii_downcase))
+                                  or (.description | ascii_downcase | contains($s | ascii_downcase))) | .name
+                   end') ;;
   esac
   [[ -n $out ]] || die "no monitor matches '$sel' (try: screenscale list)"
   printf '%s\n' "$out"
 }
 
+# The managed-block key for an output: its name for internal panels, its EDID
+# description for everything else (see "How choices are keyed" above).
+monitor_key() {
+  local name="$1" desc
+  case "$name" in
+    eDP-*|LVDS-*|DSI-*) printf '%s\n' "$name" ;;
+    *) desc=$(monitors_json | jq -r --arg n "$name" '.[] | select(.name == $n) | .description')
+       printf 'desc:%s\n' "$desc" ;;
+  esac
+}
+
 # The position saved for this output, or "auto" if we have none yet.
 saved_position() {
-  local name="$1" desc key pos
-  desc=$(monitors_json | jq -r --arg n "$1" '.[] | select(.name == $n) | .description')
-  case "$name" in eDP-*|LVDS-*|DSI-*) key="$name" ;; *) key="desc:$desc" ;; esac
+  local name="$1" key pos
+  key=$(monitor_key "$name")
   pos=$(awk -v s="$MARK_START" -v e="$MARK_END" '$0 == s { inb = 1; next } $0 == e { inb = 0 } inb' "$MONITORS_LUA" 2>/dev/null |
     sed -nE 's/^hl\.monitor\(\{ output = "'"$(printf '%s' "$key" | sed 's/[][\.*^$\/]/\\&/g')"'", mode = [^,]*, position = "([^"]*)".*/\1/p' | head -1)
   printf '%s\n' "${pos:-auto}"
@@ -88,6 +104,35 @@ clean_scale() {
       while (g % k != 0) k++
       printf "%g\n", k / 120
     }'
+}
+
+# The legal scale whose logical width lands closest to `target`, never below 1
+# (always legal: 120 divides the grid). clean_scale only rounds up, which for a
+# mode like 4096x2160 overshoots badly (2.13 -> 2.67) when 2 is right next door.
+nearest_scale() {
+  awk -v scale="$1" -v width="$2" -v height="$3" '
+    function gcd(a, b, t) { while (b) { t = a % b; a = b; b = t } return a }
+    function dist(k) { d = width / (k / 120) - width / scale; return d < 0 ? -d : d }
+    BEGIN {
+      g = gcd(width * 120, height * 120)
+      k = int(scale * 120 + 0.5)
+      if (k < 120) k = 120
+      if (k > g) k = g
+      up = k;   while (g % up != 0) up++
+      down = k; while (down > 120 && g % down != 0) down--
+      printf "%g\n", (g % down == 0 && dist(down) <= dist(up) ? down : up) / 120
+    }'
+}
+
+# Hold the adopt loop off for `seconds`, never shortening a window that is
+# already open (a hotplug opens a longer one).
+extend_settle() {
+  local until now=$(date +%s) current=0
+  until=$(( now + $1 ))
+  [[ -f $SETTLE ]] && current=$(<"$SETTLE") 2>/dev/null
+  [[ $current =~ ^[0-9]+$ ]] || current=0
+  (( until > current )) && printf '%s\n' "$until" >"$SETTLE"
+  return 0
 }
 
 # ------------------------------------------------------------------ reporting --
@@ -119,16 +164,25 @@ cmd_list() {
 # separate "approve" step: omarchy-hyprland-monitor-clamshell re-reads
 # monitors.lua every ~2s while docked and forces the internal panel back to
 # whatever it finds there, so an unsaved change would simply be undone.
+#
+# The mode sent is the one saved for this monitor, not the live one: on hotplug
+# a monitor can sit on its preferred mode for a moment, and re-sending that
+# would pin it there (an output-name rule outranks the saved desc: rule).
 apply_scale() {
-  local name="$1" requested="$2" save="${3:-}" w h rr current new
-  w=$(monitor_field "$name" width)
-  h=$(monitor_field "$name" height)
-  rr=$(monitor_field "$name" refreshRate)
+  local name="$1" requested="$2" save="${3:-}" w h mode current new
+  mode=$(saved_mode "$(monitor_key "$name")")
+  if [[ $mode == preferred ]]; then
+    w=$(monitor_field "$name" width)
+    h=$(monitor_field "$name" height)
+    mode="${w}x${h}@$(monitor_field "$name" refreshRate)"
+  else
+    w=${mode%%x*}; h=${mode#*x}; h=${h%%@*}
+  fi
   current=$(monitor_field "$name" scale)
   new=$(clean_scale "$requested" "$w" "$h")
 
   local pos; pos=$(saved_position "$name")
-  hyprctl eval "hl.monitor({ output = \"$name\", mode = \"${w}x${h}@${rr}\", position = \"$pos\", scale = $new })" >/dev/null
+  hyprctl eval "hl.monitor({ output = \"$name\", mode = \"$mode\", position = \"$pos\", scale = $new })" >/dev/null
   log_action "set $name $current -> $new (requested $requested)"
   [[ $save == --no-save ]] || persist_block
   printf '%s: scale %s -> %s  (%dx%d logical)\n' "$name" "$current" "$new" \
@@ -183,6 +237,77 @@ cmd_ppi() {
   done < <(resolve_monitors "$sel")
 }
 
+# Run a monitor at a mode other than its preferred one. Some TVs advertise
+# 4K@30 as preferred and visibly stutter there; 1080p@60 is smooth. The scale is
+# carried along so the screen keeps its apparent size, as near as a legal scale
+# allows: 4K at scale 2 becomes 1080p at scale 1, not 1080p at scale 2. It
+# never drops below 1, because a
+# sub-1 scale only renders more than the panel can show.
+cmd_mode() {
+  local mode="${1:-}" sel="${2:-focused}"
+  [[ $mode == preferred || $mode =~ ^[0-9]+x[0-9]+(@[0-9]+([.][0-9]+)?)?$ ]] ||
+    die "usage: screenscale mode <WIDTHxHEIGHT[@HZ]|preferred> [monitor]"
+  local -a names; mapfile -t names < <(resolve_monitors "$sel")
+  # Check every target before touching any, so `all` cannot half-apply.
+  local name; for name in "${names[@]}"; do mode_offered "$name" "$mode"; done
+  for name in "${names[@]}"; do apply_mode "$name" "$mode"; done
+}
+
+# Refuse a mode the monitor does not offer instead of letting Hyprland fall back
+# to something else and saving that surprise as the user's choice. A bare WxH
+# matches any rate; WxH@60 matches 59.94 as well as 60.00.
+mode_offered() {
+  local name="$1" mode="$2"
+  [[ $mode == preferred ]] && return 0
+  monitors_json | jq -e --arg n "$name" --arg m "$mode" '
+    def parse: capture("^(?<w>[0-9]+)x(?<h>[0-9]+)(@(?<r>[0-9.]+))?") | .r |= (if . then tonumber else null end);
+    ($m | parse) as $want
+    | .[] | select(.name == $n) | .availableModes
+    | any(.[]; parse | .w == $want.w and .h == $want.h
+                      and ($want.r == null or ((.r - $want.r) | fabs) < 0.5))' >/dev/null ||
+    die "$name does not offer $mode (see: hyprctl monitors)"
+}
+
+apply_mode() {
+  local name="$1" mode="$2" key w h scale nw nh new pos
+  key=$(monitor_key "$name")
+  w=$(monitor_field "$name" width); h=$(monitor_field "$name" height)
+  scale=$(monitor_field "$name" scale)
+
+  if [[ $mode == preferred ]]; then
+    # ASSUMPTION: Hyprland lists the preferred mode first. If it does not, the
+    # scale carry below is computed for the wrong size; the wait further down
+    # then times out with a warning instead of hanging.
+    read -r nw nh < <(monitors_json | jq -r --arg n "$name" \
+      '.[] | select(.name == $n) | .availableModes[0] // empty | capture("^(?<w>[0-9]+)x(?<h>[0-9]+)") | "\(.w) \(.h)"')
+  else
+    nw=${mode%%x*}; nh=${mode#*x}; nh=${nh%%@*}
+  fi
+  [[ -n ${nw:-} && -n ${nh:-} ]] || die "$name reports no modes"
+
+  new=$(nearest_scale "$(awk -v s="$scale" -v w="$w" -v nw="$nw" 'BEGIN { printf "%.4f", s * nw / w }')" "$nw" "$nh")
+  pos=$(saved_position "$name")
+
+  # Hold the adopt loop off: it would otherwise rewrite the block from the live
+  # state mid-change, with the mode still read from the old block.
+  extend_settle 5
+  hyprctl eval "hl.monitor({ output = \"$name\", mode = \"$mode\", position = \"$pos\", scale = $new })" >/dev/null
+
+  # Persist only once the compositor reports the new mode, or the block would
+  # record the old scale and lay the other monitors out around the old size.
+  local i
+  for (( i = 0; i < 30; i++ )); do
+    monitors_json | jq -e --arg n "$name" --argjson w "$nw" --argjson h "$nh" --argjson s "$new" \
+      '.[] | select(.name == $n) | .width == $w and .height == $h and ((.scale - $s) | fabs) < 0.001' >/dev/null && break
+    sleep 0.1
+  done
+  (( i < 30 )) || printf 'screenscale: %s did not report %sx%s at scale %s; saved anyway\n' "$name" "$nw" "$nh" "$new" >&2
+
+  log_action "mode $name ${w}x${h} -> $mode (scale $scale -> $new)"
+  persist_block "$key" "$mode"
+  printf '%s: %s -> %s  (scale %s -> %s)\n' "$name" "${w}x${h}" "$mode" "$scale" "$new"
+}
+
 # ---------------------------------------------------------------- persistence --
 
 # One rule per connected monitor. Internal panels are keyed by output name on a
@@ -191,8 +316,13 @@ cmd_ppi() {
 # to learn the internal panel's intended scale. If it finds none it falls back
 # through the catch-all rule and finally to a hardcoded 2 — and then forces the
 # panel to 2 every couple of seconds. Keeping this line here is what stops that.
+#
+# Modes are not live state worth capturing (a monitor always reports a concrete
+# mode, even when it is just running its preferred one), so each rule keeps the
+# mode already saved for its key — "preferred" unless `screenscale mode` chose
+# otherwise. $1 is that key->mode map as JSON.
 generate_block() {
-  monitors_json | jq -r '
+  monitors_json | jq -r --argjson modes "${1:-"{}"}" '
     def internal: test("^(eDP|LVDS|DSI)-");
     def abs: if . < 0 then -. else . end;
 
@@ -224,7 +354,7 @@ generate_block() {
            else { x: $m.x, y: $m.y }
            end) as $pos
         | ((if ($m.name | internal) then $m.name else "desc:" + $m.description end)) as $key
-        | "hl.monitor({ output = \"\($key)\", mode = \"preferred\", position = \"\($pos.x)x\($pos.y)\", scale = \($m.scale) })"
+        | "hl.monitor({ output = \"\($key)\", mode = \"\($modes[$key] // "preferred")\", position = \"\($pos.x)x\($pos.y)\", scale = \($m.scale) })"
       ] | .[]'
 }
 
@@ -235,12 +365,34 @@ saved_pairs() {
     sed -nE 's/^hl\.monitor\(\{ output = "([^"]*)", mode = .*scale = ([0-9.]+) \}\)$/\1\t\2/p'
 }
 
-# Rewrite the managed block from the live monitor state. Silent; safe to call
-# on every change and from the watcher.
+# Saved modes as a JSON object {key: mode}.
+saved_modes() {
+  [[ -f $MONITORS_LUA ]] || { echo '{}'; return 0; }
+  awk -v s="$MARK_START" -v e="$MARK_END" '$0 == s { inb = 1; next } $0 == e { inb = 0 } inb' "$MONITORS_LUA" |
+    sed -nE 's/^hl\.monitor\(\{ output = "([^"]*)", mode = "([^"]*)",.*/\1\t\2/p' |
+    jq -Rn '[inputs | split("\t") | {(.[0]): .[1]}] | add // {}'
+}
+
+# The mode saved for one key, "preferred" when none is.
+saved_mode() { saved_modes | jq -r --arg k "$1" '.[$k] // "preferred"'; }
+
+# Rewrite the managed block from the live monitor state, keeping saved modes.
+# Silent; safe to call on every change and from the watcher.
+#   persist_block [key mode]   also set (or, with "preferred", reset) one mode
+#
+# Serialised on its own lock: the adopt loop and a `mode` change can otherwise
+# both read the old modes, and whichever `mv` lands last wins.
 persist_block() {
   [[ -f $MONITORS_LUA ]] || return 0
-  local body tmp
-  body=$(generate_block)
+  { flock 8; persist_block_locked "$@"; } 8>"${XDG_RUNTIME_DIR:-/tmp}/screenscale-persist.lock"
+}
+
+persist_block_locked() {
+  local body tmp modes
+  modes=$(saved_modes)
+  [[ -n ${1:-} ]] && modes=$(jq -c --arg k "$1" --arg m "$2" \
+    'if $m == "preferred" then del(.[$k]) else .[$k] = $m end' <<<"$modes")
+  body=$(generate_block "$modes")
   [[ -n $body ]] || return 0
   tmp=$(mktemp)
   awk -v body="$body" -v s="$MARK_START" -v e="$MARK_END" '
@@ -267,7 +419,7 @@ cmd_apply() {
   json=$(monitors_json)
   while IFS=$'\t' read -r key scale; do
     [[ -n $key ]] || continue
-    local name current
+    local name current mode size
     if [[ $key == desc:* ]]; then
       name=$(printf '%s' "$json" | jq -r --arg d "${key#desc:}" '.[] | select(.description == $d) | .name' | head -1)
     else
@@ -275,7 +427,12 @@ cmd_apply() {
     fi
     [[ -n $name ]] || continue
     current=$(printf '%s' "$json" | jq -r --arg n "$name" '.[] | select(.name == $n) | .scale' | head -1)
-    awk -v a="$current" -v b="$scale" 'BEGIN { exit !(a == b) }' && continue
+    # A monitor on the wrong mode needs re-applying even if its scale matches.
+    mode=$(saved_mode "$key")
+    size=$(printf '%s' "$json" | jq -r --arg n "$name" '.[] | select(.name == $n) | "\(.width)x\(.height)"' | head -1)
+    if [[ $mode == preferred || $size == "${mode%%@*}" ]]; then
+      awk -v a="$current" -v b="$scale" 'BEGIN { exit !(a == b) }' && continue
+    fi
     apply_scale "$name" "$scale" --no-save
     changed=1
   done < <(saved_pairs)
@@ -294,11 +451,9 @@ cmd_forget() {
     echo "Removed the managed block from $MONITORS_LUA."
     return
   fi
-  local key; key=$(monitors_json | jq -r --arg s "$sel" '
-    def internal: test("^(eDP|LVDS|DSI)-");
-    .[] | select((.name | ascii_downcase | contains($s | ascii_downcase))
-              or (.description | ascii_downcase | contains($s | ascii_downcase)))
-        | if (.name | internal) then .name else "desc:" + .description end' | head -1)
+  local name key
+  name=$(resolve_monitors "$sel" | head -1)
+  key=$(monitor_key "$name")
   [[ -n $key ]] || die "no connected monitor matches '$sel'"
   grep -vF "output = \"$key\"" "$MONITORS_LUA" >"$tmp" && mv "$tmp" "$MONITORS_LUA"
   log_action "forget $key"
@@ -319,6 +474,15 @@ settle_active() {
   (( $(date +%s) < until ))
 }
 
+# True when some connected monitor is not running the mode saved for it.
+off_saved_mode() {
+  monitors_json | jq -e --argjson modes "$(saved_modes)" '
+    def internal: test("^(eDP|LVDS|DSI)-");
+    any(.[]; (if (.name | internal) then .name else "desc:" + .description end) as $k
+             | ($modes[$k] // "preferred") as $m
+             | $m != "preferred" and ($m | split("@")[0]) != "\(.width)x\(.height)")' >/dev/null
+}
+
 # Adopt scale changes made outside this tool — the Omarchy shell's display
 # panel, or `omarchy-hyprland-monitor-scaling` — by writing them into the
 # managed block. Without this, omarchy-hyprland-monitor-clamshell (which polls
@@ -334,6 +498,11 @@ adopt_loop() {
       .[] | "\(if (.name | internal) then .name else "desc:" + .description end)\t\(.scale)"' | sort)
     saved=$(saved_pairs | sort)
     [[ $live == "$saved" ]] && continue
+    # A monitor off its saved mode is mid-hotplug or was reset by another tool
+    # (clamshell, a panel re-enable); its scale belongs to the wrong mode, so
+    # leave it for cmd_apply rather than saving it.
+    off_saved_mode && continue
+    settle_active && continue
     persist_block
     log_action "adopted external change: $(printf '%s' "$live" | tr '\n' ' ')"
   done
@@ -374,7 +543,7 @@ cmd_watch() {
         # chose. Hyprland re-applies the rules in monitors.lua on reload by
         # itself, and the single-line internal rule keeps the clamshell watcher
         # happy, so nothing here is needed for reloads.
-        printf '%s\n' "$(( $(date +%s) + 5 ))" >"$SETTLE"
+        extend_settle 5
         ( for d in 0.3 1.2 3; do sleep "$d"; cmd_apply --quiet >/dev/null 2>&1 || true; done ) &
         ;;
     esac
@@ -391,6 +560,9 @@ screenscale — per-monitor display scaling for Hyprland
   screenscale set <scale> [MON]  apply a scale live       (default: focused)
   screenscale up|down [MON]      step through presets     (default: focused)
   screenscale ppi <target> [MON] scale to a target apparent density
+  screenscale mode <WxH[@HZ]|preferred> [MON]
+                                 run below the preferred resolution, keeping
+                                 apparent size (choppy TV: mode 1920x1080@60)
   screenscale save               persist current scales into monitors.lua
   screenscale apply              re-apply saved scales to what is connected now
   screenscale watch              daemon: re-apply on hotplug/reload (autostart)
@@ -410,6 +582,7 @@ and `forget` to drop an entry.
 Examples
   screenscale ppi 105 all        make every screen look the same density
   screenscale set 1 hdmi         external at native 1:1
+  screenscale mode 1920x1080@60 sony   smooth 1080p60 on a TV that stutters at 4K30
   screenscale up                 nudge the screen your mouse is on
 USAGE
 }
@@ -424,6 +597,7 @@ case "${1:-list}" in
   up)                shift; cmd_step up "$@" ;;
   down)              shift; cmd_step down "$@" ;;
   ppi)               shift; cmd_ppi "$@" ;;
+  mode)              shift; cmd_mode "$@" ;;
   save)              cmd_save ;;
   apply)             shift; cmd_apply "$@" ;;
   watch)             cmd_watch ;;
